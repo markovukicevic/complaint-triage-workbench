@@ -6,9 +6,7 @@ from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
-from pydantic import ValidationError
-
-from model_service import analyze_with_model
+from model_service import ModelCallError, analyze_with_model
 
 from triage import (
     ComplaintAnalysis,
@@ -93,13 +91,36 @@ if st.button("Analyse complaint", type="primary", disabled=not complaint.strip()
             result = analyze_with_model(complaint.strip())
             st.session_state["triage_result"] = _analysis_to_state(result, complaint.strip())
             st.session_state["triage_complaint"] = complaint.strip()
-        except ValidationError:
+        except ModelCallError as exc:
             st.session_state.pop("triage_result", None)
-            st.error("The model response did not match the required fields. Please retry or treat this case as manual review.")
+            if exc.code == "schema_validation_error":
+                fields = sorted({str(item["field"]) for item in exc.validation_issues})
+                detail = f" Affected fields: {', '.join(fields)}." if fields else ""
+                st.error("The model response did not match the required fields." + detail + " Treat this case as manual review.")
+            elif exc.code == "invalid_json":
+                st.error("The model response was not valid JSON. Treat this case as manual review.")
+            elif exc.code == "empty_content":
+                st.error("The model returned no response content. No analysis was produced.")
+            elif exc.code == "output_truncated":
+                st.error("The model response reached its output limit and may be incomplete. Treat this case as manual review.")
+            elif exc.code == "provider_filtered_output":
+                st.error("The provider did not return an analysis for this request.")
+            elif exc.code == "provider_auth_error":
+                st.error("OpenRouter rejected authentication. Check the API key configuration.")
+            elif exc.code == "provider_rate_limited":
+                st.error("OpenRouter rate-limited the request. Wait before trying again.")
+            elif exc.code == "provider_timeout":
+                st.error("The OpenRouter request timed out.")
+            elif exc.code == "provider_connection_error":
+                st.error("Could not connect to OpenRouter. Check the network connection.")
+            elif exc.code == "missing_api_key":
+                st.error("The OpenRouter API key is not configured in the project .env file.")
+            else:
+                st.error("The OpenRouter request failed. Check the request configuration and try again.")
         except Exception:
             # Provider exceptions can contain request details. Do not echo them into the app.
             st.session_state.pop("triage_result", None)
-            st.error("The OpenRouter request failed. Check the network connection, API key, model availability, and account balance, then retry.")
+            st.error("The analysis could not be completed. Treat this case as manual review.")
 
 state = st.session_state.get("triage_result")
 if state:
