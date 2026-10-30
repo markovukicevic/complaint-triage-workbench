@@ -1,0 +1,18 @@
+/data/raw/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Python virtual environment and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Private reviewed complaint pilot data and model outputs
+/data/private/
+.idea/
+.DS_Store
+/complaints/
