@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import os
 from typing import Any
@@ -7,28 +8,35 @@ from typing import Any
 import streamlit as st
 from dotenv import load_dotenv
 from model_service import ModelCallError, analyze_with_model
+from span_evidence_service import SpanEvidenceCallError, extract_span_evidence
 
 from triage import (
     ComplaintAnalysis,
     IssueCategory,
     ReviewRecord,
+    assess_analysis,
     load_examples,
     queue_for,
-    validate_grounding,
 )
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(ROOT, ".env"))
 MAX_COMPLAINT_CHARS = 12_000
+EVIDENCE_MODE = os.getenv("EVIDENCE_MODE", "span").strip().lower()
 
-def _analysis_to_state(analysis: ComplaintAnalysis, complaint: str) -> dict[str, Any]:
-    analysis, grounding_problems = validate_grounding(analysis, complaint)
+def _analysis_to_state(analysis: ComplaintAnalysis, complaint: str, evidence_mode: str = "span") -> dict[str, Any]:
+    decision = assess_analysis(analysis, complaint)
     return {
-        "analysis": analysis.model_dump(mode="json"),
-        "queue": queue_for(analysis.issue_category),
+        "result_schema_version": 2,
+        "original_model_analysis": analysis.model_dump(mode="json"),
+        "original_model_category": analysis.issue_category.value,
+        "evidence_validation": asdict(decision.evidence_validation),
+        "analysis": decision.final_analysis.model_dump(mode="json"),
+        "queue": decision.final_queue,
         "review_status": "pending",
-        "grounding_problems": grounding_problems,
+        "grounding_problems": list(decision.grounding_problems),
+        "evidence_mode": evidence_mode,
     }
 
 
@@ -89,7 +97,18 @@ if st.button("Analyse complaint", type="primary", disabled=not complaint.strip()
     with st.spinner("Analysing with GLM 5.3 Flash via OpenRouter…"):
         try:
             result = analyze_with_model(complaint.strip())
-            st.session_state["triage_result"] = _analysis_to_state(result, complaint.strip())
+            selected_mode = EVIDENCE_MODE if EVIDENCE_MODE in {"inline", "span"} else "span"
+            mode_warning = ""
+            if selected_mode == "span":
+                try:
+                    span_result = extract_span_evidence(complaint.strip(), result.issue_category)
+                    result = result.model_copy(update={"evidence": span_result.evidence})
+                except SpanEvidenceCallError:
+                    mode_warning = "Span evidence extraction failed; the inline model evidence was retained."
+                    selected_mode = "inline-fallback"
+            st.session_state["triage_result"] = _analysis_to_state(result, complaint.strip(), selected_mode)
+            if mode_warning:
+                st.session_state["triage_result"]["evidence_mode_warning"] = mode_warning
             st.session_state["triage_complaint"] = complaint.strip()
         except ModelCallError as exc:
             st.session_state.pop("triage_result", None)
@@ -127,6 +146,23 @@ if state:
     model_data = state["analysis"]
     st.divider()
     st.subheader("Review the draft")
+    raw_category = state.get("original_model_category", model_data["issue_category"])
+    evidence_check = state.get("evidence_validation", {})
+    st.caption(f"Model category: {raw_category}")
+    st.caption(f"Evidence mode: {state.get('evidence_mode', 'span')}")
+    if state.get("evidence_mode_warning"):
+        st.warning(state["evidence_mode_warning"])
+    if evidence_check:
+        st.caption(
+            "Evidence check: "
+            f"{evidence_check.get('valid_count', 0)} of {evidence_check.get('checked_count', 0)} "
+            "quotes matched the complaint exactly."
+        )
+    st.info(
+        "Final system routing: "
+        f"{queue_for(IssueCategory(model_data['issue_category']))} "
+        f"({model_data['issue_category']}). Review and correct before export."
+    )
     left, right = st.columns(2)
     with left:
         st.markdown("**Original complaint**")
@@ -181,7 +217,10 @@ if state:
         )
         final_queue = "Manual review" if review_choice == "Needs review" else queue_for(current_category)
         final_state = ReviewRecord(
+            result_schema_version=2,
             complaint_text=st.session_state.get("triage_complaint", ""),
+            original_model_category=IssueCategory(state.get("original_model_category", model_data["issue_category"])),
+            evidence_validation=state.get("evidence_validation", {}),
             **final_analysis.model_dump(),
             queue=final_queue,
             review_status=review_choice.lower(),

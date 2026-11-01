@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import hashlib
 import json
 import time
@@ -15,7 +16,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from model_service import ModelCallError, analyze_with_diagnostics, configuration_snapshot, PROMPT_VERSION
-from triage import queue_for, validate_grounding
+from triage import assess_analysis
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -31,7 +32,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="New output path under data/private/")
     parser.add_argument("--confirm-dataset-sha256", required=True, help="Expected input dataset fingerprint")
     parser.add_argument("--confirm-reference-sha256", required=True, help="Expected approved reference fingerprint")
-    parser.add_argument("--prompt-version", choices=("triage-v1", "triage-v2"), default=PROMPT_VERSION)
+    parser.add_argument("--prompt-version", choices=("triage-v1", "triage-v2", "triage-v3", "triage-v4", "triage-v5", "triage-v6", "triage-v7", "triage-v8", "taxonomy-v2", "taxonomy-v2a"), default=PROMPT_VERSION)
     args = parser.parse_args()
     if len(args.case_ids) > 3 or len(set(args.case_ids)) != len(args.case_ids):
         raise SystemExit("Select one to three distinct cases; requests are never retried.")
@@ -66,32 +67,40 @@ def main() -> None:
         started = time.perf_counter()
         try:
             response = analyze_with_diagnostics(item["narrative_redacted"], prompt_version=args.prompt_version)
-            analysis, grounding_problems = validate_grounding(response.analysis, item["narrative_redacted"])
+            decision = assess_analysis(response.analysis, item["narrative_redacted"])
             result = {
+                "result_schema_version": 2,
                 "finish_reason": response.finish_reason,
                 "usage": response.usage,
                 "case_id": item["case_id"],
                 "reference_category_draft": references[case_id]["reference_category_draft"],
                 "reference_annotation_status": references[case_id]["annotation_status"],
-                "model_category": analysis.issue_category.value,
-                "queue": queue_for(analysis.issue_category),
-                "summary": analysis.summary,
-                "requested_outcome": analysis.requested_outcome,
-                "key_facts": analysis.key_facts,
-                "missing_information": analysis.missing_information,
-                "evidence": analysis.evidence,
-                "uncertainty_reason": analysis.uncertainty_reason,
-                "grounding_problems": grounding_problems,
+                "model_category": decision.model_analysis.issue_category.value,
+                "evidence_validation": asdict(decision.evidence_validation),
+                "final_system_category": decision.final_analysis.issue_category.value,
+                "final_queue": decision.final_queue,
+                "summary": decision.final_analysis.summary,
+                "requested_outcome": decision.final_analysis.requested_outcome,
+                "key_facts": decision.final_analysis.key_facts,
+                "missing_information": decision.final_analysis.missing_information,
+                "evidence": decision.final_analysis.evidence,
+                "uncertainty_reason": decision.final_analysis.uncertainty_reason,
+                "grounding_problems": list(decision.grounding_problems),
                 "latency_seconds": round(time.perf_counter() - started, 2),
                 "request_status": "success",
             }
         except ModelCallError as exc:
             # Persist only allowlisted diagnostics. Never serialize provider or validation text.
             result = {
+                "result_schema_version": 2,
                 "case_id": item["case_id"],
                 "reference_category_draft": references[case_id]["reference_category_draft"],
                 "reference_annotation_status": references[case_id]["annotation_status"],
                 "request_status": "failed",
+                "model_category": None,
+                "evidence_validation": None,
+                "final_system_category": None,
+                "final_queue": None,
                 "error_code": exc.code,
                 "finish_reason": exc.finish_reason,
                 "validation_issues": list(exc.validation_issues),
@@ -103,9 +112,14 @@ def main() -> None:
             # Unexpected failures are deliberately reduced to a fixed label.
             result = {
                 "case_id": item["case_id"],
+                "result_schema_version": 2,
                 "reference_category_draft": references[case_id]["reference_category_draft"],
                 "reference_annotation_status": references[case_id]["annotation_status"],
                 "request_status": "failed",
+                "model_category": None,
+                "evidence_validation": None,
+                "final_system_category": None,
+                "final_queue": None,
                 "error_code": "unexpected_local_error",
                 "latency_seconds": round(time.perf_counter() - started, 2),
             }

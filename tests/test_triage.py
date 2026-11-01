@@ -9,7 +9,7 @@ from openai import APIStatusError
 from pydantic import ValidationError
 
 from model_service import (
-    MAX_OUTPUT_TOKENS, MAX_RETRIES, MODEL_ID, PROMPT_SHA256_V1, PROMPT_SHA256_V2, PROMPT_VERSION,
+    EVALUATION_BASELINE_PROMPT_VERSION, MAX_OUTPUT_TOKENS, MAX_RETRIES, MODEL_ID, PROMPT_SHA256_V1, PROMPT_SHA256_V2, PROMPT_VERSION,
     REASONING_EFFORT, REQUEST_TIMEOUT_SECONDS, RESPONSE_FORMAT, SYSTEM_PROMPT,
     SYSTEM_PROMPT_V2,
     TEMPERATURE, ModelCallError, analyze_with_diagnostics, analyze_with_model,
@@ -17,10 +17,13 @@ from model_service import (
 )
 from streamlit.testing.v1 import AppTest
 
-from triage import ComplaintAnalysis, IssueCategory, load_examples, queue_for, validate_grounding
+from triage import ComplaintAnalysis, IssueCategory, assess_analysis, inspect_evidence, load_examples, queue_for, validate_grounding
 
 
 class TriageTests(unittest.TestCase):
+    def test_evaluation_baseline_is_frozen_to_taxonomy_v2a(self):
+        self.assertEqual(EVALUATION_BASELINE_PROMPT_VERSION, "taxonomy-v2a")
+
     def test_prompt_does_not_infer_an_unstated_requested_outcome(self):
         self.assertIn("state the concrete action the consumer asks the company to take", SYSTEM_PROMPT)
         self.assertIn("Do not infer a remedy from the problem, harm, or facts", SYSTEM_PROMPT)
@@ -44,6 +47,7 @@ class TriageTests(unittest.TestCase):
                 "reasoning_effort": "low",
                 "timeout_seconds": 45,
                 "max_retries": 0,
+                "repair_retry_limit": 1,
             },
         )
         self.assertEqual((MODEL_ID, TEMPERATURE, MAX_OUTPUT_TOKENS), ("z-ai/glm-5.3-flash", 0, 4096))
@@ -74,7 +78,7 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(configuration_snapshot("triage-v2")["prompt_sha256"], PROMPT_SHA256_V2)
         self.assertEqual(configuration_snapshot("triage-v2")["max_output_tokens"], 4096)
         with self.assertRaises(ValueError):
-            prompt_for_version("triage-v3")
+            prompt_for_version("triage-v9")
 
     def test_demo_examples_are_fictional_and_load(self):
         examples = load_examples()
@@ -110,7 +114,52 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(checked.evidence, ["I paid $75 on June 4"])
         self.assertEqual(problems, [])
 
-    def test_missing_or_invented_evidence_routes_to_manual_review(self):
+    def test_assessment_preserves_category_when_some_evidence_is_valid(self):
+        complaint = "I disputed the $45 charge. The bank sent a letter."
+        model_analysis = ComplaintAnalysis(
+            issue_category=IssueCategory.PURCHASE_DISPUTE,
+            summary="The consumer disputes a $45 charge.",
+            requested_outcome="",
+            key_facts=["$45 charge"],
+            missing_information=[],
+            evidence=["I disputed the $45 charge", "The bank refunded the charge."],
+            uncertainty_reason="",
+        )
+
+        decision = assess_analysis(model_analysis, complaint)
+
+        self.assertEqual(decision.model_analysis.issue_category, IssueCategory.PURCHASE_DISPUTE)
+        self.assertEqual(decision.model_analysis.evidence[1], "The bank refunded the charge.")
+        self.assertEqual(decision.evidence_validation.checked_count, 2)
+        self.assertEqual(decision.evidence_validation.valid_count, 1)
+        self.assertEqual(decision.evidence_validation.invalid_count, 1)
+        self.assertEqual(decision.evidence_validation.invalid_indexes, (1,))
+        self.assertEqual(decision.final_analysis.issue_category, IssueCategory.PURCHASE_DISPUTE)
+        self.assertEqual(decision.final_queue, "Transactions and disputes")
+        self.assertEqual(decision.final_analysis.evidence, ["I disputed the $45 charge"])
+
+    def test_evidence_validation_distinguishes_no_quotes_from_invalid_quotes(self):
+        base = {
+            "issue_category": IssueCategory.FEES_INTEREST,
+            "summary": "The consumer reports a fee.",
+            "requested_outcome": "",
+            "key_facts": [],
+            "missing_information": [],
+            "uncertainty_reason": "",
+        }
+        no_quotes = ComplaintAnalysis(**base, evidence=[])
+        invalid_quote = ComplaintAnalysis(**base, evidence=["The fee was refunded."])
+
+        absent = inspect_evidence(no_quotes, "I see a fee.")
+        invalid = inspect_evidence(invalid_quote, "I see a fee.")
+
+        self.assertEqual((absent.checked_count, absent.valid_count, absent.invalid_count), (0, 0, 0))
+        self.assertTrue(absent.missing_evidence)
+        self.assertEqual((invalid.checked_count, invalid.valid_count, invalid.invalid_count), (1, 0, 1))
+        self.assertEqual(invalid.invalid_indexes, (0,))
+        self.assertTrue(invalid.missing_evidence)
+
+    def test_missing_or_invented_evidence_preserves_model_category_with_warning(self):
         complaint = "I paid $75 on June 4, but the payment is missing."
         for evidence in ([], ["The bank refused to help."]):
             with self.subTest(evidence=evidence):
@@ -124,8 +173,8 @@ class TriageTests(unittest.TestCase):
                     uncertainty_reason="",
                 )
                 checked, problems = validate_grounding(analysis, complaint)
-                self.assertEqual(checked.issue_category, IssueCategory.MANUAL_REVIEW)
-                self.assertEqual(queue_for(checked.issue_category), "Manual review")
+                self.assertEqual(checked.issue_category, IssueCategory.PAYMENT_BILLING)
+                self.assertEqual(queue_for(checked.issue_category), "Payment servicing")
                 self.assertTrue(problems)
 
     def test_schema_rejects_unapproved_categories(self):
@@ -195,10 +244,36 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(call.kwargs["response_format"], {"type": "json_object"})
         self.assertEqual(call.kwargs["extra_body"], {"reasoning": {"effort": "low"}})
 
+    @patch.dict(os.environ, {"OPENROUTER_GLM_API_KEY": "test-key"})
+    @patch("model_service.OpenAI")
+    def test_v3_request_uses_strict_schema_without_changing_prompt(self, openai_class):
+        payload = {
+            "issue_category": IssueCategory.MANUAL_REVIEW.value,
+            "summary": "The complaint is unclear.",
+            "requested_outcome": "",
+            "key_facts": [],
+            "missing_information": [],
+            "evidence": [],
+            "uncertainty_reason": "The product is unclear.",
+        }
+        mock_client = openai_class.return_value
+        mock_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=json.dumps(payload)))],
+            usage=None,
+        )
+        analyze_with_diagnostics("Fictional unclear product complaint.", prompt_version="triage-v3")
+        call = mock_client.chat.completions.create.call_args
+        response_format = call.kwargs["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertFalse(response_format["json_schema"]["schema"]["additionalProperties"])
+        self.assertEqual(call.kwargs["extra_body"]["reasoning"], {"effort": "low"})
+        self.assertTrue(call.kwargs["extra_body"]["provider"]["require_parameters"])
+
     @patch("model_service.OpenAI")
     def test_unknown_prompt_version_fails_before_client_creation(self, openai_class):
         with self.assertRaises(ValueError):
-            analyze_with_diagnostics("Fictional complaint", prompt_version="triage-v3")
+            analyze_with_diagnostics("Fictional complaint", prompt_version="triage-v9")
         openai_class.assert_not_called()
 
     @patch.dict(os.environ, {"OPENROUTER_GLM_API_KEY": "test-key"})
@@ -358,6 +433,15 @@ class TriageTests(unittest.TestCase):
         )
         app = AppTest.from_file(str(Path(__file__).resolve().parent.parent / "app.py"), default_timeout=10)
         app.session_state["triage_result"] = {
+            "result_schema_version": 2,
+            "original_model_category": IssueCategory.PAYMENT_BILLING.value,
+            "evidence_validation": {
+                "checked_count": 1,
+                "valid_count": 1,
+                "invalid_count": 0,
+                "invalid_indexes": (),
+                "missing_evidence": False,
+            },
             "analysis": analysis.model_dump(mode="json"),
             "queue": queue_for(analysis.issue_category),
             "review_status": "pending",
@@ -365,6 +449,10 @@ class TriageTests(unittest.TestCase):
         }
         app.session_state["triage_complaint"] = complaint
         app.run()
+        captions = [item.value for item in app.caption]
+        self.assertTrue(any(item == "Model category: Payment or billing process" for item in captions))
+        self.assertTrue(any("Evidence check: 1 of 1" in item for item in captions))
+        self.assertTrue(any("Final system routing: Payment servicing" in item for item in [entry.value for entry in app.info]))
         app.selectbox(key="review_category").select(IssueCategory.FEES_INTEREST.value).run()
         self.assertEqual(app.text_input[0].value, "Fees and interest")
         app.text_area(key="review_summary").set_value("Reviewer corrected the payment summary.").run()
@@ -376,6 +464,9 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(exported["queue"], "Manual review")
         self.assertEqual(exported["review_status"], "needs review")
         self.assertEqual(exported["complaint_text"], complaint)
+        self.assertEqual(exported["result_schema_version"], 2)
+        self.assertEqual(exported["original_model_category"], IssueCategory.PAYMENT_BILLING.value)
+        self.assertEqual(exported["evidence_validation"]["valid_count"], 1)
 
     def test_changing_input_clears_stale_analysis_and_export(self):
         complaint = "I paid $75 on June 4, but the payment is missing."

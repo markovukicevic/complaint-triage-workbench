@@ -21,6 +21,8 @@ Ensure `.env` contains `OPENROUTER_GLM_API_KEY=...`. If `.env` does not exist, c
 streamlit run app.py
 ```
 
+Evidence extraction defaults to the span-ID extractor, which selects literal passages from the complaint after classification. It adds a second model call but does not change the model category. To use the original inline evidence instead, set `EVIDENCE_MODE=inline` in `.env` and restart Streamlit. If the span call fails, the app retains the inline evidence and shows a warning.
+
 The development configuration binds to `127.0.0.1` so this local milestone is reachable only from your computer.
 
 The app uses OpenRouter model `z-ai/glm-5.3-flash`. Each analysis sends the complaint text to OpenRouter and may incur API charges. The key stays server-side. Avoid submitting sensitive information. The app does not write pasted complaint text to disk; it remains in the active browser session and can be exported by the reviewer.
@@ -33,7 +35,7 @@ Choose one of the fictional examples, click **Analyse complaint**, inspect the o
 
 - Five approved starting issue categories with fixed queue mapping.
 - Summary, requested outcome, key facts, missing information, evidence excerpts, and uncertainty reason.
-- Manual-review routing for unsupported or unclear cases and evidence quotations that fail exact matching.
+- Manual-review routing for unsupported or unclear cases, with evidence warnings shown separately.
 - Human review fields and JSON export.
 - Fictional examples only; Consumer Financial Protection Bureau source data and evaluation cases are not loaded into the app yet.
 

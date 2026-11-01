@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from enum import Enum
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -36,7 +37,10 @@ class ComplaintAnalysis(BaseModel):
 
 
 class ReviewRecord(BaseModel):
+    result_schema_version: int = 2
     complaint_text: str
+    original_model_category: IssueCategory
+    evidence_validation: dict[str, Any]
     issue_category: IssueCategory
     queue: str
     summary: str
@@ -52,23 +56,77 @@ def queue_for(category: IssueCategory) -> str:
     return QUEUE_BY_CATEGORY.get(category, "Manual review")
 
 
-def validate_grounding(analysis: ComplaintAnalysis, complaint: str) -> tuple[ComplaintAnalysis, list[str]]:
-    """Keep only exact evidence excerpts and route unsupported output to a person."""
-    valid = [quote for quote in analysis.evidence if quote.strip() and quote in complaint]
+@dataclass(frozen=True)
+class EvidenceValidation:
+    """Safe accounting of quote checks; quote text itself is not copied here."""
+
+    checked_count: int
+    valid_count: int
+    invalid_count: int
+    invalid_indexes: tuple[int, ...]
+    missing_evidence: bool
+
+    @property
+    def has_warnings(self) -> bool:
+        return self.invalid_count > 0 or self.missing_evidence
+
+
+@dataclass(frozen=True)
+class TriageDecision:
+    model_analysis: ComplaintAnalysis
+    evidence_validation: EvidenceValidation
+    final_analysis: ComplaintAnalysis
+    grounding_problems: tuple[str, ...]
+    final_queue: str
+
+
+def inspect_evidence(analysis: ComplaintAnalysis, complaint: str) -> EvidenceValidation:
+    valid_indexes = tuple(
+        index for index, quote in enumerate(analysis.evidence)
+        if quote.strip() and quote in complaint
+    )
+    return EvidenceValidation(
+        checked_count=len(analysis.evidence),
+        valid_count=len(valid_indexes),
+        invalid_count=len(analysis.evidence) - len(valid_indexes),
+        invalid_indexes=tuple(index for index in range(len(analysis.evidence)) if index not in valid_indexes),
+        missing_evidence=len(valid_indexes) == 0,
+    )
+
+
+def assess_analysis(analysis: ComplaintAnalysis, complaint: str) -> TriageDecision:
+    """Preserve the model proposal and separately derive evidence and routing outcomes."""
+    validation = inspect_evidence(analysis, complaint)
+    valid = [quote for index, quote in enumerate(analysis.evidence) if index not in validation.invalid_indexes]
     problems: list[str] = []
-    if len(valid) != len(analysis.evidence):
+    if validation.invalid_count:
         problems.append("One or more evidence excerpts did not exactly match the complaint text.")
     if not valid:
         problems.append("The model did not provide a verifiable excerpt from the complaint.")
+    final_analysis = analysis
     if problems:
-        analysis = analysis.model_copy(
+        # Preserve the model's category and expose evidence problems separately.
+        # Evidence quality is a review signal, not a category override.
+        final_analysis = analysis.model_copy(
             update={
-                "issue_category": IssueCategory.MANUAL_REVIEW,
+                "issue_category": analysis.issue_category,
                 "evidence": valid,
                 "uncertainty_reason": " ".join(filter(None, [analysis.uncertainty_reason, *problems])),
             }
         )
-    return analysis, problems
+    return TriageDecision(
+        model_analysis=analysis,
+        evidence_validation=validation,
+        final_analysis=final_analysis,
+        grounding_problems=tuple(problems),
+        final_queue=queue_for(final_analysis.issue_category),
+    )
+
+
+def validate_grounding(analysis: ComplaintAnalysis, complaint: str) -> tuple[ComplaintAnalysis, list[str]]:
+    """Compatibility helper returning the evidence-filtered final decision."""
+    decision = assess_analysis(analysis, complaint)
+    return decision.final_analysis, list(decision.grounding_problems)
 
 
 
